@@ -619,11 +619,6 @@ fn check_fn(ck: &mut Checker<'_>, f: &FnDecl) {
             // top-level fn (a closure callee shares its captures with the
             // new task; an unknown callee is fail-closed, O4.9).
             Stmt::Task { callee, args, span } => {
-                ck.mark_move_in_value(
-                    &mut st,
-                    callee,
-                    format!("the spawn callee `{}`", callee.render()),
-                );
                 let desc = format!("the spawn `task {}(...)`", callee.render());
                 let vals: Vec<&Expr> = args.iter().map(|a| &a.value).collect();
                 let targets = ck.spawn_param_shapes(&st, callee, args.len());
@@ -637,6 +632,11 @@ fn check_fn(ck: &mut Checker<'_>, f: &FnDecl) {
                     false,
                     Some(callee),
                     targets.as_deref(),
+                );
+                ck.mark_move_in_value(
+                    &mut st,
+                    callee,
+                    format!("the spawn callee `{}`", callee.render()),
                 );
                 let cr = walk::CallRef {
                     callee,
@@ -655,11 +655,6 @@ fn check_fn(ck: &mut Checker<'_>, f: &FnDecl) {
                 is_move,
                 span,
             } => {
-                ck.mark_move_in_value(
-                    &mut st,
-                    chan,
-                    format!("the send target `{}`", chan.render()),
-                );
                 // Target classification (#77) runs FIRST: a non-channel (or
                 // unresolvable) send target is ill-typed — no value cascade.
                 if ck.check_send_target(&st, chan, *span) {
@@ -687,6 +682,11 @@ fn check_fn(ck: &mut Checker<'_>, f: &FnDecl) {
                     );
                     ck.check_chan_send_const_overflow(&st, chan, value);
                 }
+                ck.mark_move_in_value(
+                    &mut st,
+                    chan,
+                    format!("the send target `{}`", chan.render()),
+                );
             }
 
             // Loop variables: fresh bindings per iteration shape.
@@ -751,7 +751,10 @@ fn check_fn(ck: &mut Checker<'_>, f: &FnDecl) {
             // defines its names inside that arm's own scope via
             // `ScopeEvent::SelectRecv` (see `walk.rs`).
             Stmt::Select { arms, .. } => {
+                let pre_select_st = st.clone();
+                let mut arm_states: Vec<FnState> = Vec::with_capacity(arms.len());
                 for arm in arms {
+                    let mut arm_st = pre_select_st.clone();
                     match &arm.kind {
                         SelectArmKind::Send {
                             chan,
@@ -759,13 +762,8 @@ fn check_fn(ck: &mut Checker<'_>, f: &FnDecl) {
                             is_move,
                             ..
                         } => {
-                            ck.mark_move_in_value(
-                                &mut st,
-                                chan,
-                                format!("the select-send target `{}`", chan.render()),
-                            );
                             let span = chan.span().to(value.span());
-                            if ck.check_send_target(&st, chan, span) {
+                            if ck.check_send_target(&arm_st, chan, span) {
                                 // C5: a select send clause is a sendability
                                 // check-site "exactly like statement sends", so
                                 // the class-3 owned-move route (`ch <- move v`)
@@ -789,9 +787,9 @@ fn check_fn(ck: &mut Checker<'_>, f: &FnDecl) {
                                     )
                                 };
                                 let vals: Vec<&Expr> = vec![value];
-                                let targets = ck.chan_elem_shape(&st, chan);
+                                let targets = ck.chan_elem_shape(&arm_st, chan);
                                 ck.check_site(
-                                    &mut st,
+                                    &mut arm_st,
                                     span,
                                     "HYB-E3002",
                                     &vals,
@@ -801,17 +799,55 @@ fn check_fn(ck: &mut Checker<'_>, f: &FnDecl) {
                                     None,
                                     targets.as_deref(),
                                 );
-                                ck.check_chan_send_const_overflow(&st, chan, value);
+                                ck.check_chan_send_const_overflow(&arm_st, chan, value);
                             }
+                            ck.mark_move_in_value(
+                                &mut arm_st,
+                                chan,
+                                format!("the select-send target `{}`", chan.render()),
+                            );
                         }
                         SelectArmKind::Recv { chan, .. } => {
                             ck.mark_move_in_value(
-                                &mut st,
+                                &mut arm_st,
                                 chan,
                                 format!("the select-recv `{}`", chan.render()),
                             );
                         }
                         SelectArmKind::Default => {}
+                    }
+                    arm_states.push(arm_st);
+                }
+                for arm_st in arm_states {
+                    for (k, b) in arm_st.env {
+                        if let Some(mv) = b.moved.clone() {
+                            if let Some(dst) = st.env.get_mut(&k) {
+                                if dst.moved.is_none() {
+                                    dst.moved = Some(mv);
+                                }
+                                if dst.non_owned_origin.is_none() {
+                                    dst.non_owned_origin = b.non_owned_origin;
+                                }
+                            } else {
+                                st.env.insert(k, b);
+                            }
+                        }
+                    }
+                    for (depth, scope) in arm_st.scopes.into_iter().enumerate() {
+                        if let Some(dst_scope) = st.scopes.get_mut(depth) {
+                            for (k, b) in scope {
+                                if let Some(mv) = b.moved {
+                                    if let Some(dst) = dst_scope.get_mut(&k) {
+                                        if dst.moved.is_none() {
+                                            dst.moved = Some(mv);
+                                        }
+                                        if dst.non_owned_origin.is_none() {
+                                            dst.non_owned_origin = b.non_owned_origin;
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -5176,5 +5212,376 @@ mod tests {
             .count();
         assert_eq!(e3006_count, 2, "{:?}", r.diagnostics);
     }
-}
 
+    #[test]
+    fn send_and_select_send_is_move_enforces_same_stmt_and_capture_e3003() {
+        let same_stmt_index = check(
+            r#"fn main() {
+               ch := make(chan map[string]int, 1)
+               chans := []chan map[string]int{ch}
+               m := map[string]int{"k": 0}
+               chans[m["k"]] <- move m
+             }"#,
+        );
+        assert_eq!(
+            same_stmt_index.verdict,
+            Verdict::Reject,
+            "{:?}",
+            same_stmt_index.diagnostics
+        );
+        assert!(
+            same_stmt_index
+                .diagnostics
+                .iter()
+                .any(|d| d.code == "HYB-E3003"),
+            "{:?}",
+            same_stmt_index.diagnostics
+        );
+
+        let same_stmt_alias = check(
+            r#"fn main() {
+               ch := make(chan map[string]int, 1)
+               chans := []chan map[string]int{ch}
+               m := map[string]int{"k": 0}
+               alias := m
+               chans[alias["k"]] <- move m
+             }"#,
+        );
+        assert_eq!(
+            same_stmt_alias.verdict,
+            Verdict::Reject,
+            "{:?}",
+            same_stmt_alias.diagnostics
+        );
+        assert!(
+            same_stmt_alias
+                .diagnostics
+                .iter()
+                .any(|d| d.code == "HYB-E3003"),
+            "{:?}",
+            same_stmt_alias.diagnostics
+        );
+
+        let select_double_move = check(
+            r#"fn main() {
+               ch1 := make(chan map[string]int, 1)
+               ch2 := make(chan map[string]int, 1)
+               m := map[string]int{"k": 0}
+               select {
+                 ch1 <- move m: {}
+                 ch2 <- move m: {}
+               }
+             }"#,
+        );
+        assert_eq!(
+            select_double_move.verdict,
+            Verdict::Reject,
+            "{:?}",
+            select_double_move.diagnostics
+        );
+        assert!(
+            select_double_move
+                .diagnostics
+                .iter()
+                .any(|d| d.code == "HYB-E3003"),
+            "{:?}",
+            select_double_move.diagnostics
+        );
+
+        let closure_send_move = check(
+            r#"fn main() {
+               ch := make(chan map[string]int, 1)
+               m := map[string]int{"k": 0}
+               f := fn() {
+                 ch <- move m
+               }
+               f()
+               m["k"] = 2
+             }"#,
+        );
+        assert_eq!(
+            closure_send_move.verdict,
+            Verdict::Reject,
+            "{:?}",
+            closure_send_move.diagnostics
+        );
+        assert!(
+            closure_send_move
+                .diagnostics
+                .iter()
+                .any(|d| d.code == "HYB-E3003"),
+            "{:?}",
+            closure_send_move.diagnostics
+        );
+
+        let clean = check(
+            r#"fn main() {
+               ch1 := make(chan map[string]int, 1)
+               ch2 := make(chan map[string]int, 1)
+               m1 := map[string]int{"k": 1}
+               m2 := map[string]int{"k": 2}
+               select {
+                 ch1 <- move m1: {}
+                 ch2 <- move m2: {}
+               }
+             }"#,
+        );
+        assert_eq!(clean.verdict, Verdict::Accept, "{:?}", clean.diagnostics);
+    }
+
+    #[test]
+    fn select_arms_and_send_targets_do_not_suppress_e3002_via_earlier_move() {
+        let select_move_then_plain = check(
+            r#"fn main() {
+               ch1 := make(chan map[string]int, 1)
+               ch2 := make(chan map[string]int, 1)
+               m := map[string]int{"k": 0}
+               select {
+                 ch1 <- move m: {}
+                 ch2 <- m: {}
+               }
+             }"#,
+        );
+        assert_eq!(
+            select_move_then_plain.verdict,
+            Verdict::Reject,
+            "{:?}",
+            select_move_then_plain.diagnostics
+        );
+        assert!(
+            select_move_then_plain
+                .diagnostics
+                .iter()
+                .any(|d| d.code == "HYB-E3002"),
+            "{:?}",
+            select_move_then_plain.diagnostics
+        );
+        assert!(
+            select_move_then_plain
+                .diagnostics
+                .iter()
+                .any(|d| d.code == "HYB-E3003"),
+            "{:?}",
+            select_move_then_plain.diagnostics
+        );
+
+        let select_struct_addr = check(
+            r#"struct item { x int }
+             fn main() {
+               ch_val := make(chan item, 1)
+               ch_ptr := make(chan *item, 1)
+               s := item{x: 1}
+               select {
+                 ch_val <- move s: {}
+                 ch_ptr <- &s: {}
+               }
+             }"#,
+        );
+        assert_eq!(
+            select_struct_addr.verdict,
+            Verdict::Reject,
+            "{:?}",
+            select_struct_addr.diagnostics
+        );
+        assert!(
+            select_struct_addr
+                .diagnostics
+                .iter()
+                .any(|d| d.code == "HYB-E3002"),
+            "{:?}",
+            select_struct_addr.diagnostics
+        );
+
+        let closure_select_body_move = check(
+            r#"fn worker(x map[string]int) { x["k"] = 1 }
+             fn main() {
+               ch1 := make(chan int, 1)
+               ch2 := make(chan map[string]int, 1)
+               f := fn() {
+                 m := map[string]int{"k": 0}
+                 select {
+                   v := <-ch1: {
+                     fmt.println(v)
+                     task worker(move m)
+                   }
+                   ch2 <- m: {}
+                 }
+               }
+               f()
+             }"#,
+        );
+        assert_eq!(
+            closure_select_body_move.verdict,
+            Verdict::Reject,
+            "{:?}",
+            closure_select_body_move.diagnostics
+        );
+        assert!(
+            closure_select_body_move
+                .diagnostics
+                .iter()
+                .any(|d| d.code == "HYB-E3002"),
+            "{:?}",
+            closure_select_body_move.diagnostics
+        );
+    }
+
+    #[test]
+    fn self_move_and_parallel_move_preserve_const_immutability_e3006_and_a3_loans_e3102() {
+        let self_move_const = check(
+            r#"const shared_m = map[string]int{"a": 1}
+             fn main() {
+               if true {
+                 shared_m := move shared_m
+                 shared_m["a"] = 2
+               }
+             }"#,
+        );
+        assert_eq!(
+            self_move_const.verdict,
+            Verdict::Reject,
+            "{:?}",
+            self_move_const.diagnostics
+        );
+        assert!(
+            self_move_const
+                .diagnostics
+                .iter()
+                .any(|d| d.code == "HYB-E3006"),
+            "{:?}",
+            self_move_const.diagnostics
+        );
+
+        let parallel_move_const_alias = check(
+            r#"const shared_m = map[string]int{"a": 1}
+             fn main() {
+               c := shared_m
+               c, b := map[string]int{"a": 9}, move c
+               fmt.println(c["a"])
+               b["a"] = 2
+             }"#,
+        );
+        assert_eq!(
+            parallel_move_const_alias.verdict,
+            Verdict::Reject,
+            "{:?}",
+            parallel_move_const_alias.diagnostics
+        );
+        assert!(
+            parallel_move_const_alias
+                .diagnostics
+                .iter()
+                .any(|d| d.code == "HYB-E3006"),
+            "{:?}",
+            parallel_move_const_alias.diagnostics
+        );
+
+        let closure_self_move_const = check(
+            r#"const shared_m = map[string]int{"a": 1}
+             fn main() {
+               c := shared_m
+               f := fn() {
+                 c := move c
+                 c["a"] = 2
+               }
+               f()
+             }"#,
+        );
+        assert_eq!(
+            closure_self_move_const.verdict,
+            Verdict::Reject,
+            "{:?}",
+            closure_self_move_const.diagnostics
+        );
+        assert!(
+            closure_self_move_const
+                .diagnostics
+                .iter()
+                .any(|d| d.code == "HYB-E3006"),
+            "{:?}",
+            closure_self_move_const.diagnostics
+        );
+
+        let parallel_move_a3_loan = check(
+            r#"fn main() {
+               m := map[string]int{"a": 1}
+               alias := m
+               s := &alias["a"]
+               x, m := 1, move m
+               m["b"] = x
+               fmt.println(s)
+             }"#,
+        );
+        assert_eq!(
+            parallel_move_a3_loan.verdict,
+            Verdict::Reject,
+            "{:?}",
+            parallel_move_a3_loan.diagnostics
+        );
+        assert!(
+            parallel_move_a3_loan
+                .diagnostics
+                .iter()
+                .any(|d| d.code == "HYB-E3102"),
+            "{:?}",
+            parallel_move_a3_loan.diagnostics
+        );
+    }
+
+    #[test]
+    fn callee_returning_moved_const_preserves_e3006_and_e3004() {
+        let return_move_const_write = check(
+            r#"const shared_m = map[string]int{"a": 1}
+             fn get_k() map[string]int {
+               return move shared_m
+             }
+             fn main() {
+               m := get_k()
+               m["a"] = 2
+             }"#,
+        );
+        assert_eq!(
+            return_move_const_write.verdict,
+            Verdict::Reject,
+            "{:?}",
+            return_move_const_write.diagnostics
+        );
+        assert!(
+            return_move_const_write
+                .diagnostics
+                .iter()
+                .any(|d| d.code == "HYB-E3006"),
+            "{:?}",
+            return_move_const_write.diagnostics
+        );
+
+        let return_moved_local_const_spawn = check(
+            r#"const shared_m = map[string]int{"a": 1}
+             fn get_k() map[string]int {
+               c := move shared_m
+               return c
+             }
+             fn worker(x map[string]int) {
+               x["a"] = 2
+             }
+             fn main() {
+               m := get_k()
+               task worker(move m)
+             }"#,
+        );
+        assert_eq!(
+            return_moved_local_const_spawn.verdict,
+            Verdict::Reject,
+            "{:?}",
+            return_moved_local_const_spawn.diagnostics
+        );
+        assert!(
+            return_moved_local_const_spawn
+                .diagnostics
+                .iter()
+                .any(|d| d.code == "HYB-E3004"),
+            "{:?}",
+            return_moved_local_const_spawn.diagnostics
+        );
+    }
+}

@@ -557,7 +557,7 @@ fn check_stmt_boundaries<'a>(ck: &mut Checker<'_>, st: &mut FnState, stmt: &'a S
                                 b.non_owned_origin = Some(origin);
                             }
                         }
-                        ck.record_move_const_and_a3_loans(st, name, value, 0);
+                        ck.record_move_const_and_a3_loans(st, &pre_st, name, value, 0);
                         continue;
                     }
                     let reads_self = !is_fresh_copy && ck.value_reads_storage_of(&pre_st, value, name);
@@ -657,7 +657,7 @@ fn check_stmt_boundaries<'a>(ck: &mut Checker<'_>, st: &mut FnState, stmt: &'a S
                     // so local aliases of non-owned captured bindings inherit origin
                     // and cannot bypass O5.1 / O5.4 move restrictions.
                     ck.record_storage_from_snapshot(st, &pre_st, name, value, &overwritten, true, false);
-                    ck.record_move_const_and_a3_loans(st, name, value, 0);
+                    ck.record_move_const_and_a3_loans(st, &pre_st, name, value, 0);
 
                     ck.record_closure_mutations(st, name, value);
                     if let Some(origin) = shadowed_origin.or(moved_non_owned) {
@@ -791,7 +791,7 @@ fn check_stmt_boundaries<'a>(ck: &mut Checker<'_>, st: &mut FnState, stmt: &'a S
                             }
                         }
                         if let Some(v) = val_opt {
-                            ck.record_move_const_and_a3_loans(st, &name, v, 0);
+                            ck.record_move_const_and_a3_loans(st, &pre_st, &name, v, 0);
                         }
                     }
                 }
@@ -802,11 +802,6 @@ fn check_stmt_boundaries<'a>(ck: &mut Checker<'_>, st: &mut FnState, stmt: &'a S
             sync_nested_moves(st, nested);
         }
         Stmt::Task { callee, args, span } => {
-            ck.mark_move_in_value(
-                st,
-                callee,
-                format!("the spawn callee `{}`", callee.render()),
-            );
             let desc = format!("the spawn `task {}(...)`", callee.render());
             let vals: Vec<&Expr> = args.iter().map(|a| &a.value).collect();
             let targets = ck.spawn_param_shapes(st, callee, args.len());
@@ -821,6 +816,11 @@ fn check_stmt_boundaries<'a>(ck: &mut Checker<'_>, st: &mut FnState, stmt: &'a S
                 Some(callee),
                 targets.as_deref(),
             );
+            ck.mark_move_in_value(
+                st,
+                callee,
+                format!("the spawn callee `{}`", callee.render()),
+            );
             sync_nested_moves(st, nested);
             collect_stmt_direct_fnlits(stmt, st, nested);
         }
@@ -830,11 +830,6 @@ fn check_stmt_boundaries<'a>(ck: &mut Checker<'_>, st: &mut FnState, stmt: &'a S
             is_move,
             span,
         } => {
-            ck.mark_move_in_value(
-                st,
-                chan,
-                format!("the send target `{}`", chan.render()),
-            );
             // Target classification (#77) first: a non-channel (or
             // unresolvable) send target is ill-typed — no value cascade.
             if ck.check_send_target(st, chan, *span) {
@@ -852,25 +847,27 @@ fn check_stmt_boundaries<'a>(ck: &mut Checker<'_>, st: &mut FnState, stmt: &'a S
                 ck.check_site(st, *span, "HYB-E3002", &vals, managed, &desc, *is_move, None, targets.as_deref());
                 ck.check_chan_send_const_overflow(st, chan, value);
             }
+            ck.mark_move_in_value(
+                st,
+                chan,
+                format!("the send target `{}`", chan.render()),
+            );
             sync_nested_moves(st, nested);
             collect_stmt_direct_fnlits(stmt, st, nested);
         }
         Stmt::Select { arms, .. } => {
+            let pre_select_st = st.clone();
+            let mut arm_states: Vec<FnState> = Vec::with_capacity(arms.len());
             for arm in arms {
-                st.scope_push();
+                let mut arm_st = pre_select_st.clone();
                 match &arm.kind {
                     SelectArmKind::Send {
                         chan,
                         value,
                         is_move,
                     } => {
-                        ck.mark_move_in_value(
-                            st,
-                            chan,
-                            format!("the select-send target `{}`", chan.render()),
-                        );
                         let span = chan.span().to(value.span());
-                        if ck.check_send_target(st, chan, span) {
+                        if ck.check_send_target(&arm_st, chan, span) {
                             // C5: a select-send clause takes the SAME rules as
                             // a statement send — including the class-3
                             // owned-move route (`ch <- move v`). The parser's
@@ -886,40 +883,91 @@ fn check_stmt_boundaries<'a>(ck: &mut Checker<'_>, st: &mut FnState, stmt: &'a S
                                 format!("the select-send `{} <- {}`", chan.render(), value.render())
                             };
                             let vals: Vec<&Expr> = vec![value];
-                            let targets = ck.chan_elem_shape(st, chan);
-                            ck.check_site(st, span, "HYB-E3002", &vals, managed, &desc, *is_move, None, targets.as_deref());
-                            ck.check_chan_send_const_overflow(st, chan, value);
+                            let targets = ck.chan_elem_shape(&arm_st, chan);
+                            ck.check_site(&mut arm_st, span, "HYB-E3002", &vals, managed, &desc, *is_move, None, targets.as_deref());
+                            ck.check_chan_send_const_overflow(&arm_st, chan, value);
                         }
-                        sync_nested_moves(st, nested);
-                        collect_expr_direct_fnlits(chan, st, nested);
-                        collect_expr_direct_fnlits(value, st, nested);
-                    }
-                    SelectArmKind::Recv { names, chan } => {
                         ck.mark_move_in_value(
-                            st,
+                            &mut arm_st,
+                            chan,
+                            format!("the select-send target `{}`", chan.render()),
+                        );
+                    }
+                    SelectArmKind::Recv { chan, .. } => {
+                        ck.mark_move_in_value(
+                            &mut arm_st,
                             chan,
                             format!("the select-recv `{}`", chan.render()),
                         );
-                        sync_nested_moves(st, nested);
-                        collect_expr_direct_fnlits(chan, st, nested);
-                        // element shape when the channel resolves; `ok` is a
-                        // bool; unresolvable stays Unknown (fail-closed, O4.9)
-                        let elem = match ck.shape_of_expr(st, chan) {
-                            TypeShape::Chan(e) => *e,
-                            _ => TypeShape::Unknown,
-                        };
-                        for (i, n) in names.iter().enumerate() {
-                            let shape = if i == 0 {
-                                elem.clone()
-                            } else {
-                                TypeShape::Primitive
-                            };
-                            mark_nested_overwritten(st, n, nested);
-                            ck.define_binding(st, n, shape, None, false, managed, false);
-                        }
-                        sync_nested_moves(st, nested);
                     }
                     SelectArmKind::Default => {}
+                }
+                arm_states.push(arm_st);
+            }
+            for arm_st in arm_states {
+                for (k, b) in arm_st.env {
+                    if let Some(mv) = b.moved.clone() {
+                        if let Some(dst) = st.env.get_mut(&k) {
+                            if dst.moved.is_none() {
+                                dst.moved = Some(mv);
+                            }
+                            if dst.non_owned_origin.is_none() {
+                                dst.non_owned_origin = b.non_owned_origin;
+                            }
+                        } else {
+                            st.env.insert(k, b);
+                        }
+                    }
+                }
+                for (depth, scope) in arm_st.scopes.into_iter().enumerate() {
+                    if let Some(dst_scope) = st.scopes.get_mut(depth) {
+                        for (k, b) in scope {
+                            if let Some(mv) = b.moved {
+                                if let Some(dst) = dst_scope.get_mut(&k) {
+                                    if dst.moved.is_none() {
+                                        dst.moved = Some(mv);
+                                    }
+                                    if dst.non_owned_origin.is_none() {
+                                        dst.non_owned_origin = b.non_owned_origin;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            sync_nested_moves(st, nested);
+            for arm in arms {
+                match &arm.kind {
+                    SelectArmKind::Send { chan, value, .. } => {
+                        collect_expr_direct_fnlits(chan, st, nested);
+                        collect_expr_direct_fnlits(value, st, nested);
+                    }
+                    SelectArmKind::Recv { chan, .. } => {
+                        collect_expr_direct_fnlits(chan, st, nested);
+                    }
+                    SelectArmKind::Default => {}
+                }
+            }
+            for arm in arms {
+                st.scope_push();
+                if let SelectArmKind::Recv { names, chan } = &arm.kind {
+                    // element shape when the channel resolves; `ok` is a
+                    // bool; unresolvable stays Unknown (fail-closed, O4.9)
+                    let elem = match ck.shape_of_expr(st, chan) {
+                        TypeShape::Chan(e) => *e,
+                        _ => TypeShape::Unknown,
+                    };
+                    for (i, n) in names.iter().enumerate() {
+                        let shape = if i == 0 {
+                            elem.clone()
+                        } else {
+                            TypeShape::Primitive
+                        };
+                        mark_nested_overwritten(st, n, nested);
+                        ck.define_binding(st, n, shape, None, false, managed, false);
+                    }
+                    sync_nested_moves(st, nested);
                 }
                 check_body_boundaries(ck, st, &arm.body, managed, nested);
                 pop_scope_and_sync(st, nested);

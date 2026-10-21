@@ -1600,7 +1600,7 @@ impl<'a> Checker<'a> {
                             }
                         }
                     }
-                    self.record_move_const_and_a3_loans(st, &info.name, &l.values[0], idx);
+                    self.record_move_const_and_a3_loans(st, &pre_st, &info.name, &l.values[0], idx);
                 }
             }
             // Every name is bound now: join results the callee returns twice.
@@ -1713,7 +1713,7 @@ impl<'a> Checker<'a> {
                             b.non_owned_origin = Some(origin);
                         }
                     }
-                    self.record_move_const_and_a3_loans(st, name, value, idx);
+                    self.record_move_const_and_a3_loans(st, &pre_st, name, value, idx);
                     continue;
                 }
                 // Self-shadowing define (`m := m`, `h := h`, `m := same(m)`
@@ -1831,7 +1831,7 @@ impl<'a> Checker<'a> {
                 // mutable GC storage with its source — so a later `move` of
                 // either must freeze the other (O5.2).
                 self.record_storage_from_snapshot(st, &pre_st, name, value, &overwritten, true, false);
-                self.record_move_const_and_a3_loans(st, name, value, idx);
+                self.record_move_const_and_a3_loans(st, &pre_st, name, value, idx);
                 // alias recording: `m2 := agg` (single-parent link, the
                 // friendlier "frozen alias" diagnostic) — and call results
                 // that hand back argument storage (#38).
@@ -2576,46 +2576,69 @@ impl<'a> Checker<'a> {
     pub(crate) fn record_move_const_and_a3_loans(
         &self,
         st: &mut FnState,
+        pre_st: &FnState,
         name: &str,
         value: &Expr,
         idx: usize,
     ) {
         let mut moved_srcs = Vec::new();
         collect_move_ident_sources(value, &mut moved_srcs);
+        self.collect_callee_const_return_roots(pre_st, value, &mut moved_srcs, 0);
         if moved_srcs.is_empty() {
             return;
         }
         for src in moved_srcs {
-            if src == name {
-                continue;
-            }
             let place = Place {
                 kind: PlaceKind::Ident(src.clone()),
                 span: value.span(),
             };
-            if let Some(const_root) = self.const_write_root(st, &place) {
-                st.share_edge(name, &const_root);
+            if let Some(const_root) = self.const_write_root(pre_st, &place) {
+                if let Some(b) = st.env_lookup_mut(name) {
+                    if b.non_owned_origin.is_none() {
+                        b.non_owned_origin = Some(format!("`const {}`", const_root));
+                    }
+                }
+                if const_root != name {
+                    st.share_edge(name, &const_root);
+                }
             }
-            let inherited: Vec<Loan> = st
+            let inherited: Vec<Loan> = pre_st
                 .loans
                 .iter()
                 .filter_map(|l| match &l.target {
                     LoanTarget::MapSlot { binding, path, key }
                         if l.created <= idx
                             && idx <= l.last
-                            && a3_paths_conflict(st, path, &src) =>
+                            && a3_paths_conflict(pre_st, path, &src) =>
                     {
-                        Some(Loan {
-                            target: LoanTarget::MapSlot {
-                                binding: binding.clone(),
-                                path: name.to_string(),
-                                key: key.clone(),
-                            },
-                            created: l.created,
-                            last: l.last,
-                            span: l.span,
-                            desc: l.desc.clone(),
-                        })
+                        let already_present = st.loans.iter().any(|existing| {
+                            existing.created == l.created
+                                && existing.last == l.last
+                                && existing.span == l.span
+                                && matches!(
+                                    &existing.target,
+                                    LoanTarget::MapSlot {
+                                        binding: eb,
+                                        path: ep,
+                                        key: ek,
+                                    } if eb == binding && ep == name && ek == key
+                                )
+                        });
+                        if already_present {
+                            None
+                        } else {
+                            Some(Loan {
+                                target: LoanTarget::MapSlot {
+                                    binding: binding.clone(),
+                                    path: name.to_string(),
+                                    key: key.clone(),
+                                },
+                                created: l.created,
+                                last: l.last,
+                                span: l.span,
+                                desc: l.desc.clone(),
+                            })
+                        }
                     }
                     _ => None,
                 })
@@ -4277,8 +4300,8 @@ impl<'a> Checker<'a> {
             return;
         }
         match unwrap_parens(value) {
-            Expr::Move { .. } => {}
-            Expr::Try { operand, .. }
+            Expr::Move { operand, .. }
+            | Expr::Try { operand, .. }
             | Expr::Slice { base: operand, .. }
             | Expr::Field { base: operand, .. }
             | Expr::Index { base: operand, .. }
@@ -4347,6 +4370,7 @@ impl<'a> Checker<'a> {
                      -> HashSet<String> {
                         let mut roots = Vec::new();
                         collect_ref_roots(e, &mut roots);
+                        collect_move_ident_sources(e, &mut roots);
                         self.collect_callee_const_return_roots(st, e, &mut roots, depth + 1);
                         let mut set = HashSet::new();
                         for r in roots {
@@ -5587,7 +5611,7 @@ impl<'a> Checker<'a> {
                         }
                     }
                     if !info.is_fresh_copy { self.record_storage_from_snapshot(st, &pre_st, name, v, &overwritten, false, false); }
-                    self.record_move_const_and_a3_loans(st, name, v, idx);
+                    self.record_move_const_and_a3_loans(st, &pre_st, name, v, idx);
                     // rebind may create a fresh alias — ident copies AND
                     // call results that hand back argument storage (#38)
 
@@ -5612,6 +5636,7 @@ impl<'a> Checker<'a> {
                 }
             }
         } else if values.len() == 1 && targets.len() > 1 {
+            let pre_st = st.clone();
             let moved_non_owned = self.moved_non_owned_origin_in_expr(st, &values[0]);
             let shapes = self.multi_value_shapes(st, &values[0], targets.len());
             let tys = self.multi_value_tys(st, &values[0], targets.len());
@@ -5739,7 +5764,7 @@ impl<'a> Checker<'a> {
                         }
                     }
                     if may_share {
-                        self.record_move_const_and_a3_loans(st, name, &values[0], idx);
+                        self.record_move_const_and_a3_loans(st, &pre_st, name, &values[0], idx);
                     }
                 } else {
                     let root = t.root();
@@ -6078,6 +6103,7 @@ impl<'a> Checker<'a> {
                         .collect();
 
                     if *op == AssignOp::Assign && targets.len() == values.len() {
+                        let pre_cst = cst.clone();
                         let rhs_info: Vec<(TypeShape, Option<hy_syntax::TypeExpr>)> = values
                             .iter()
                             .map(|v| (self.shape_of_expr(&cst, v), self.ty_of_expr(&cst, v)))
@@ -6109,7 +6135,7 @@ impl<'a> Checker<'a> {
                                 cst.aliases.remove(name);
                                 cst.share_clear(name);
                                 self.record_may_share(&mut cst, name, v);
-                                self.record_move_const_and_a3_loans(&mut cst, name, v, 0);
+                                self.record_move_const_and_a3_loans(&mut cst, &pre_cst, name, v, 0);
                                 self.record_alias(&mut cst, name, v);
                                 cst.closure_mutates.remove(name);
                                 cst.closure_defs.remove(name);
@@ -6344,7 +6370,7 @@ impl<'a> Checker<'a> {
                 self.record_storage_from_snapshot(st, &pre_st, name, value, &overwritten, true, false);
             }
             self.record_closure_mutations(st, name, value);
-            self.record_move_const_and_a3_loans(st, name, value, 0);
+            self.record_move_const_and_a3_loans(st, &pre_st, name, value, 0);
         }
     }
 
