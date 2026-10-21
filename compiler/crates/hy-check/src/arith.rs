@@ -24,6 +24,14 @@ impl<'a> Checker<'a> {
                 self.check_expr_const_zero_divisor(&crate::model::FnState::default(), &c.value);
             }
         }
+        if self
+            .file
+            .fns()
+            .find_map(|f| Self::first_flattened_stmt_span(f.body.as_ref()?))
+            .is_none()
+        {
+            self.run_file_close_and_range_directions();
+        }
     }
 
     pub(crate) fn check_stmt_const_zero_divisor(&mut self, st: &crate::model::FnState, stmt: &Stmt) {

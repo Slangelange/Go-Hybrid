@@ -286,17 +286,30 @@ impl<'a> Checker<'a> {
                 }
             }
             Expr::Field { base, .. } => self.check_expr_recv_operands(st, base),
-            Expr::StructLit { fields, .. } => {
+            Expr::StructLit { ty, fields, .. } => {
+                if let Some(ty) = ty {
+                    self.check_type_recv_operands(st, ty);
+                }
                 for f in fields {
                     self.check_expr_recv_operands(st, &f.value);
                 }
             }
-            Expr::SliceLit { items, .. } => {
+            Expr::SliceLit { elem, items, .. } => {
+                if let Some(elem) = elem {
+                    self.check_type_recv_operands(st, elem);
+                }
                 for it in items {
                     self.check_expr_recv_operands(st, it);
                 }
             }
-            Expr::MapLit { entries, .. } => {
+            Expr::MapLit {
+                key,
+                value,
+                entries,
+                ..
+            } => {
+                self.check_type_recv_operands(st, key);
+                self.check_type_recv_operands(st, value);
                 for (k, v) in entries {
                     self.check_expr_recv_operands(st, k);
                     self.check_expr_recv_operands(st, v);
@@ -309,7 +322,17 @@ impl<'a> Checker<'a> {
                     }
                 }
             }
-            Expr::FnLit { .. } | Expr::Ident { .. } | Expr::Lit { .. } => {}
+            Expr::FnLit {
+                params, results, ..
+            } => {
+                for p in params {
+                    self.check_type_recv_operands(st, &p.ty);
+                }
+                for r in results {
+                    self.check_type_recv_operands(st, &r.ty);
+                }
+            }
+            Expr::Ident { .. } | Expr::Lit { .. } => {}
         }
     }
 
@@ -321,12 +344,39 @@ impl<'a> Checker<'a> {
             Expr::Paren { inner, .. }
             | Expr::Move { operand: inner, .. }
             | Expr::Try { operand: inner, .. } => self.recv_chan_type_expr(st, inner),
+            Expr::Ident { name, .. } => {
+                let root = crate::freeze::resolve_alias(st, name);
+                self.lookup_binding(st, &root).and_then(|b| b.ty.clone())
+            }
             Expr::Receive { chan, .. } => {
                 let outer_ty = self.recv_chan_type_expr(st, chan)?;
                 match self.resolve_type_alias(&outer_ty) {
                     hy_syntax::TypeExpr::Chan { elem, .. } => Some(*elem),
                     _ => None,
                 }
+            }
+            Expr::Index { base, .. } => {
+                let base_ty = self.recv_chan_type_expr(st, base)?;
+                match self.peel_pointer_and_alias(&base_ty) {
+                    hy_syntax::TypeExpr::Slice { elem, .. }
+                    | hy_syntax::TypeExpr::Array { elem, .. }
+                    | hy_syntax::TypeExpr::Map { value: elem, .. } => Some(*elem),
+                    _ => None,
+                }
+            }
+            Expr::Call { callee, args, .. } => {
+                if let Expr::Field { base, name, .. } = crate::model::unwrap_parens(callee) {
+                    let head = Self::base_named_type_str(name);
+                    if (head == "unwrap" && args.is_empty()) || (head == "or" && args.len() == 1) {
+                        let base_ty = self.recv_chan_type_expr(st, base)?;
+                        if let hy_syntax::TypeExpr::Option { elem, .. } =
+                            self.resolve_type_alias(&base_ty)
+                        {
+                            return Some(*elem);
+                        }
+                    }
+                }
+                None
             }
             _ => None,
         }

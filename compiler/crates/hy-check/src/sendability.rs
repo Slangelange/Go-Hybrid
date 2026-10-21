@@ -241,9 +241,18 @@ impl<'a> Checker<'a> {
     pub(crate) fn classify_value(&self, st: &FnState, expr: &Expr) -> Outcome {
         // `move x` — class 3; validate that `x` resolves to a movable shape
         // (never Unknown, Closure, BorrowHandle, or ForeignOpaque).
-        if let Expr::Move { operand, .. } = unwrap_parens(expr) {
-            if let Expr::Ident { name, .. } = unwrap_parens(operand) {
+        let expr = unwrap_parens(expr);
+        if let Expr::Move { operand, .. } = expr {
+            let op = unwrap_parens(operand);
+            if let Expr::Ident { name, .. } = op {
                 return self.classify_move_ident(st, name);
+            }
+            if matches!(op, Expr::Field { .. })
+                && matches!(self.shape_of_expr(st, op), TypeShape::OwnHandle(_))
+            {
+                if let Some(root) = op.root_ident() {
+                    return self.classify_move_ident(st, root);
+                }
             }
             return Outcome::Ok;
         }
@@ -1181,8 +1190,19 @@ impl<'a> Checker<'a> {
             if implicit_move {
                 let op = crate::model::unwrap_parens(v);
                 if let Expr::Ident { name, span: ispan } = op {
-                    if self.lookup_binding(st, name).is_some() {
-                        if !managed {
+                    if let Some(b) = self.lookup_binding(st, name) {
+                        if managed {
+                            if !b.shape.is_sendable_by_type()
+                                && !b.managed_taint
+                                && self.non_owned_origin_of(st, name).is_some()
+                            {
+                                rejects.push(RejectInfo {
+                                    value: name.clone(),
+                                    ty: self.binding_ty_str(b),
+                                    notes: Vec::new(),
+                                });
+                            }
+                        } else {
                             self.check_non_owned_move(st, name, *ispan);
                         }
                         moves.push((name.clone(), *ispan));
@@ -1196,14 +1216,44 @@ impl<'a> Checker<'a> {
                     && matches!(self.shape_of_expr(st, op), TypeShape::OwnHandle(_))
                 {
                     if let Some(root) = op.root_ident() {
-                        if self.lookup_binding(st, root).is_some() {
-                            if !managed {
+                        if let Some(b) = self.lookup_binding(st, root) {
+                            if managed {
+                                if !b.shape.is_sendable_by_type()
+                                    && !b.managed_taint
+                                    && self.non_owned_origin_of(st, root).is_some()
+                                {
+                                    rejects.push(RejectInfo {
+                                        value: root.to_string(),
+                                        ty: self.binding_ty_str(b),
+                                        notes: Vec::new(),
+                                    });
+                                }
+                            } else {
                                 self.check_non_owned_move(st, root, v.span());
                             }
                             moves.push((root.to_string(), v.span()));
                         }
                     }
-                } else if !managed {
+                } else if managed {
+                    let shape = self.shape_of_expr(st, op);
+                    if matches!(shape, TypeShape::Unknown) {
+                        unprovens.push(UnprovenInfo {
+                            value: op.render(),
+                            reason: "the expression's result type did not resolve to a sendability class".to_string(),
+                        });
+                    } else if !shape.is_sendable_by_type() {
+                        rejects.push(RejectInfo {
+                            value: op.render(),
+                            ty: shape.render(),
+                            notes: Vec::new(),
+                        });
+                    }
+                    if let Some(root) = op.root_ident() {
+                        if self.lookup_binding(st, root).is_some() {
+                            moves.push((root.to_string(), v.span()));
+                        }
+                    }
+                } else {
                     self.check_o54_non_ident_move(st, op, v.span());
                 }
                 if let Expr::Ident { name, .. } = op {
@@ -1222,13 +1272,26 @@ impl<'a> Checker<'a> {
             }
 
             let mut v_moves = Vec::new();
+            let mut nested_move_outcomes = Vec::new();
             crate::model::collect_move_operands(v, &mut v_moves);
             for (op, mspan) in v_moves {
                 if let Expr::Ident { name, .. } = op {
-                    if self.lookup_binding(st, name).is_some() {
-                        if !managed {
+                    if let Some(b) = self.lookup_binding(st, name) {
+                        if managed {
+                            if !b.shape.is_sendable_by_type()
+                                && !b.managed_taint
+                                && self.non_owned_origin_of(st, name).is_some()
+                            {
+                                rejects.push(RejectInfo {
+                                    value: name.clone(),
+                                    ty: self.binding_ty_str(b),
+                                    notes: Vec::new(),
+                                });
+                            }
+                        } else {
                             self.check_non_owned_move(st, name, mspan);
                         }
+                        nested_move_outcomes.push(self.classify_move_ident(st, name));
                         moves.push((name.clone(), mspan));
                     } else {
                         unprovens.push(UnprovenInfo {
@@ -1240,14 +1303,45 @@ impl<'a> Checker<'a> {
                     && matches!(self.shape_of_expr(st, op), TypeShape::OwnHandle(_))
                 {
                     if let Some(root) = op.root_ident() {
-                        if self.lookup_binding(st, root).is_some() {
-                            if !managed {
+                        if let Some(b) = self.lookup_binding(st, root) {
+                            if managed {
+                                if !b.shape.is_sendable_by_type()
+                                    && !b.managed_taint
+                                    && self.non_owned_origin_of(st, root).is_some()
+                                {
+                                    rejects.push(RejectInfo {
+                                        value: root.to_string(),
+                                        ty: self.binding_ty_str(b),
+                                        notes: Vec::new(),
+                                    });
+                                }
+                            } else {
                                 self.check_non_owned_move(st, root, mspan);
                             }
+                            nested_move_outcomes.push(self.classify_move_ident(st, root));
                             moves.push((root.to_string(), mspan));
                         }
                     }
-                } else if !managed {
+                } else if managed {
+                    let shape = self.shape_of_expr(st, op);
+                    if matches!(shape, TypeShape::Unknown) {
+                        unprovens.push(UnprovenInfo {
+                            value: op.render(),
+                            reason: "the expression's result type did not resolve to a sendability class".to_string(),
+                        });
+                    } else if !shape.is_sendable_by_type() {
+                        rejects.push(RejectInfo {
+                            value: op.render(),
+                            ty: shape.render(),
+                            notes: Vec::new(),
+                        });
+                    }
+                    if let Some(root) = op.root_ident() {
+                        if self.lookup_binding(st, root).is_some() {
+                            moves.push((root.to_string(), mspan));
+                        }
+                    }
+                } else {
                     self.check_o54_non_ident_move(st, op, mspan);
                 }
             }
@@ -1291,13 +1385,34 @@ impl<'a> Checker<'a> {
 
             match outcome {
                 Outcome::Ok => {
-                    if let Some((got, want)) = send_elem_mismatch {
-                        self.emit_chan_elem_mismatch_send(
-                            &got,
-                            &want,
-                            v.span(),
-                            &format!("`{}`", v.render()),
-                        );
+                    let mut nested_bad = false;
+                    for mo in nested_move_outcomes {
+                        match mo {
+                            Outcome::Ok => {}
+                            Outcome::Managed { desc, risky } => {
+                                if risky {
+                                    managed_descs.push(desc);
+                                }
+                            }
+                            Outcome::Rejected(info) => {
+                                nested_bad = true;
+                                rejects.push(info);
+                            }
+                            Outcome::Unproven(info) => {
+                                nested_bad = true;
+                                unprovens.push(info);
+                            }
+                        }
+                    }
+                    if !nested_bad {
+                        if let Some((got, want)) = send_elem_mismatch {
+                            self.emit_chan_elem_mismatch_send(
+                                &got,
+                                &want,
+                                v.span(),
+                                &format!("`{}`", v.render()),
+                            );
+                        }
                     }
                 }
                 Outcome::Managed { desc, risky } => {
@@ -1423,14 +1538,33 @@ impl<'a> Checker<'a> {
     ///      fields/elements, and channel sends/receives of channel elements)
     ///      reject unidirectional channel direction mismatches with `HYB-E3012`
     ///      (issue #623).
+    pub(crate) fn first_flattened_stmt_span(block: &hy_syntax::Block) -> Option<Span> {
+        for s in &block.stmts {
+            match s {
+                hy_syntax::Stmt::Block { block: b, .. }
+                | hy_syntax::Stmt::Managed { body: b, .. } => {
+                    if let Some(sp) = Self::first_flattened_stmt_span(b) {
+                        return Some(sp);
+                    }
+                }
+                _ => return Some(s.span()),
+            }
+        }
+        None
+    }
+
     pub(crate) fn check_file_close_and_range_directions(&mut self, trigger_stmt: &hy_syntax::Stmt) {
         let first_span = self
             .file
             .fns()
-            .find_map(|f| f.body.as_ref()?.stmts.first().map(|s| s.span()));
+            .find_map(|f| Self::first_flattened_stmt_span(f.body.as_ref()?));
         if first_span != Some(trigger_stmt.span()) {
             return;
         }
+        self.run_file_close_and_range_directions();
+    }
+
+    pub(crate) fn run_file_close_and_range_directions(&mut self) {
         let mut const_env = ChanDirEnv::new();
         let const_decls: Vec<&'a hy_syntax::ConstDecl> = self
             .file
@@ -1537,13 +1671,20 @@ impl<'a> Checker<'a> {
                         }
                     }
                 } else {
+                    let pre_env = env.clone();
+                    let inferred_tys: Vec<Option<hy_syntax::TypeExpr>> = l
+                        .names
+                        .iter()
+                        .enumerate()
+                        .map(|(i, _)| l.values.get(i).and_then(|v| self.dir_ty_of_expr(v, &pre_env)))
+                        .collect();
                     for (i, name) in l.names.iter().enumerate() {
                         if name != "_" {
-                            let ty = l.values.get(i).and_then(|v| self.dir_ty_of_expr(v, env));
+                            let ty = inferred_tys.get(i).cloned().flatten();
                             if l.kind == LocalKind::Define && l.names.len() > 1 {
-                                if let Some(Some(existing_ty)) = env.lookup_current_scope(name) {
+                                if let Some(Some(existing_ty)) = pre_env.lookup_current_scope(name) {
                                     if let Some(v) = l.values.get(i) {
-                                        self.check_expr_against_ty(v, &existing_ty, env);
+                                        self.check_expr_against_ty(v, &existing_ty, &pre_env);
                                     }
                                     continue;
                                 }
@@ -2300,7 +2441,7 @@ impl<'a> Checker<'a> {
         }
     }
 
-    fn peel_pointer_and_alias(&self, ty: &hy_syntax::TypeExpr) -> hy_syntax::TypeExpr {
+    pub(crate) fn peel_pointer_and_alias(&self, ty: &hy_syntax::TypeExpr) -> hy_syntax::TypeExpr {
         let mut cur = self.resolve_type_alias(ty);
         while let hy_syntax::TypeExpr::Pointer { to, .. } = cur {
             cur = self.resolve_type_alias(&to);
@@ -2508,7 +2649,7 @@ impl<'a> Checker<'a> {
         let Some(ty) = self.dir_ty_of_expr(expr, env) else {
             return vec![None; n_vars.max(1)];
         };
-        match self.resolve_type_alias(&ty) {
+        match self.peel_pointer_and_alias(&ty) {
             TypeExpr::Chan { elem, .. } => {
                 let e = Some(*elem);
                 if n_vars >= 2 {
@@ -2531,6 +2672,19 @@ impl<'a> Checker<'a> {
                 } else {
                     vec![Some(*value)]
                 }
+            }
+            TypeExpr::Named { name: sname, .. } => {
+                if let Some(("set", mut targs)) = Self::parse_generic_type_args(&sname) {
+                    if let Some(elem_ty) = targs.pop() {
+                        let e = Some(elem_ty);
+                        if n_vars >= 2 {
+                            return vec![e, None];
+                        } else {
+                            return vec![e];
+                        }
+                    }
+                }
+                vec![None; n_vars.max(1)]
             }
             _ => vec![None; n_vars.max(1)],
         }
@@ -2673,6 +2827,14 @@ impl<'a> Checker<'a> {
     ) -> Option<Vec<hy_syntax::TypeExpr>> {
         use hy_syntax::TypeExpr;
         match unwrap_parens(expr) {
+            Expr::Move { operand, .. } => self.dir_multi_ty_of_call(operand, env),
+            Expr::Try { operand, .. } => {
+                let mut tys = self.dir_multi_ty_of_call(operand, env)?;
+                if !tys.is_empty() {
+                    tys.pop();
+                }
+                Some(tys)
+            }
             Expr::Receive { chan, span } => {
                 let chan_ty = self.dir_ty_of_expr(chan, env)?;
                 if let TypeExpr::Chan { elem, .. } = self.resolve_type_alias(&chan_ty) {
@@ -2797,7 +2959,7 @@ impl<'a> Checker<'a> {
             }
             PlaceKind::Index { base, .. } => {
                 let base_ty = self.dir_ty_of_place(base, env)?;
-                match self.resolve_type_alias(&base_ty) {
+                match self.peel_pointer_and_alias(&base_ty) {
                     TypeExpr::Slice { elem, .. }
                     | TypeExpr::Array { elem, .. }
                     | TypeExpr::Map { value: elem, .. } => Some(*elem),
@@ -2844,7 +3006,7 @@ impl<'a> Checker<'a> {
             }
             Expr::Index { base, .. } => {
                 let base_ty = self.dir_ty_of_expr(base, env)?;
-                match self.resolve_type_alias(&base_ty) {
+                match self.peel_pointer_and_alias(&base_ty) {
                     TypeExpr::Slice { elem, .. }
                     | TypeExpr::Array { elem, .. }
                     | TypeExpr::Map { value: elem, .. } => Some(*elem),
@@ -2853,7 +3015,7 @@ impl<'a> Checker<'a> {
             }
             Expr::Slice { base, span, .. } => {
                 let base_ty = self.dir_ty_of_expr(base, env)?;
-                match self.resolve_type_alias(&base_ty) {
+                match self.peel_pointer_and_alias(&base_ty) {
                     TypeExpr::Slice { elem, .. } | TypeExpr::Array { elem, .. } => {
                         Some(TypeExpr::Slice { elem, span: *span })
                     }
@@ -3015,6 +3177,11 @@ impl<'a> Checker<'a> {
                     let resolved_base = self.resolve_type_alias(&base_ty);
                     if head == "pop" && args.is_empty() {
                         if let TypeExpr::Slice { elem, .. } = resolved_base {
+                            return Some(*elem);
+                        }
+                    }
+                    if (head == "unwrap" && args.is_empty()) || (head == "or" && args.len() == 1) {
+                        if let TypeExpr::Option { elem, .. } = resolved_base {
                             return Some(*elem);
                         }
                     }
@@ -3224,4 +3391,293 @@ fn unproven_atomic_reason(b: &Binding) -> Option<String> {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use crate::{check_file, Verdict};
+    use hy_diag::Severity;
+    use hy_syntax::parse_file;
 
+    fn check(src: &str) -> crate::CheckResult {
+        let ast = parse_file("sendability_test.hy", src).expect("snippet parses");
+        check_file(&ast)
+    }
+
+    #[test]
+    fn managed_move_of_non_owned_and_gc_field_emits_e8001_and_freezes_root() {
+        // Part 1a: moving a non-owned parameter/capture/const inside `managed`
+        // must increment `sites_via_managed` and emit `HYB-E8001` (O6.1 / O6.3).
+        let r_param = check(
+            "fn worker(m map[string]int, done chan<- bool) {\n\
+               m[\"k\"] = 1\n\
+               done <- true\n\
+             }\n\
+             fn relay(p map[string]int, done chan<- bool) {\n\
+               managed(\"caller synchronizes access\", \"mutex\") {\n\
+                 task worker(move p, done)\n\
+               }\n\
+             }\n",
+        );
+        assert_eq!(r_param.verdict, Verdict::Accept, "{:?}", r_param.diagnostics);
+        assert_eq!(r_param.managed.sites_via_managed, 1);
+        assert!(r_param
+            .diagnostics
+            .iter()
+            .any(|d| d.code == "HYB-E8001" && d.severity == Severity::Warning));
+
+        // Part 1b: moving a GC struct field (`move s.m`) inside `managed`
+        // must emit `HYB-E8001`, count `sites_via_managed == 1`, AND freeze `s`
+        // so post-managed mutation of `s.m` rejects with `HYB-E3003`.
+        let r_field = check(
+            "struct state { m map[string]int }\n\
+             fn worker(m map[string]int, done chan<- bool) {\n\
+               m[\"k\"] = 1\n\
+               done <- true\n\
+             }\n\
+             fn main() {\n\
+               s := state{m: map[string]int{\"k\": 0}}\n\
+               done := make(chan bool, 1)\n\
+               managed(\"guarded handoff\", \"mutex\") {\n\
+                 task worker(move s.m, done)\n\
+               }\n\
+               s.m[\"k\"] = 2\n\
+               <-done\n\
+             }\n",
+        );
+        assert_eq!(r_field.verdict, Verdict::Reject, "{:?}", r_field.diagnostics);
+        assert_eq!(r_field.managed.sites_via_managed, 1);
+        assert!(r_field.diagnostics.iter().any(|d| d.code == "HYB-E8001"));
+        assert!(r_field.diagnostics.iter().any(|d| d.code == "HYB-E3003"));
+
+        // Part 1c: nested `move` of a closure / borrow-handle inside a projection or call
+        // at a spawn/send site must still run `classify_move_ident` and reject, while
+        // parenthesized composite literals wrapping valid moves (`(box{m: move m})`) accept.
+        let r_nested_closure = check(
+            "struct pkt { id int\n cb fn() }\n\
+             fn worker(n int) { _ = n }\n\
+             fn main() {\n\
+               m := map[string]int{\"k\": 0}\n\
+               f := fn() { m[\"k\"] = 1 }\n\
+               task worker((pkt{id: 1, cb: move f}).id)\n\
+             }\n",
+        );
+        assert_eq!(
+            r_nested_closure.verdict,
+            Verdict::Reject,
+            "{:?}",
+            r_nested_closure.diagnostics
+        );
+        assert!(r_nested_closure
+            .diagnostics
+            .iter()
+            .any(|d| d.code == "HYB-E3001"));
+
+        let r_paren_ok = check(
+            "struct box { m map[string]int }\n\
+             fn worker(b box, done chan<- bool) {\n\
+               b.m[\"k\"] = 1\n\
+               done <- true\n\
+             }\n\
+             fn main() {\n\
+               m := map[string]int{\"k\": 0}\n\
+               done := make(chan bool, 1)\n\
+               task worker((box{m: move m}), done)\n\
+               <-done\n\
+             }\n",
+        );
+        assert_eq!(
+            r_paren_ok.verdict,
+            Verdict::Accept,
+            "{:?}",
+            r_paren_ok.diagnostics
+        );
+    }
+
+    #[test]
+    fn channel_direction_pass_runs_when_first_stmt_is_managed_or_block_or_const_only() {
+        // Part 2a: first statement of first function is `managed(...) { ... }`.
+        let r_managed_first = check(
+            "fn main() {\n\
+               managed(\"init\", \"mutex\") {\n\
+                 x := 1\n\
+                 _ = x\n\
+               }\n\
+               var rc <-chan int = make(chan<- int, 1)\n\
+               close(rc)\n\
+               rc <- 1\n\
+             }\n",
+        );
+        assert_eq!(
+            r_managed_first.verdict,
+            Verdict::Reject,
+            "{:?}",
+            r_managed_first.diagnostics
+        );
+        assert!(r_managed_first
+            .diagnostics
+            .iter()
+            .any(|d| d.code == "HYB-E3012"));
+        assert!(r_managed_first
+            .diagnostics
+            .iter()
+            .any(|d| d.code == "HYB-E3009"));
+        assert!(r_managed_first
+            .diagnostics
+            .iter()
+            .any(|d| d.code == "HYB-E3008"));
+
+        // Part 2b: first statement of first function is a nested `{ ... }` block.
+        let r_block_first = check(
+            "fn setup() {\n\
+               {\n\
+                 x := 1\n\
+                 _ = x\n\
+               }\n\
+             }\n\
+             fn bad(sc chan<- int) {\n\
+               for v in sc {\n\
+                 _ = v\n\
+               }\n\
+             }\n",
+        );
+        assert_eq!(
+            r_block_first.verdict,
+            Verdict::Reject,
+            "{:?}",
+            r_block_first.diagnostics
+        );
+        assert!(r_block_first
+            .diagnostics
+            .iter()
+            .any(|d| d.code == "HYB-E3009"));
+    }
+
+    #[test]
+    fn chan_dir_env_preserves_try_multireturn_option_unwrap_parallel_define_and_ptr_array() {
+        // Part 3a: `?`-unwrapped multi-return call preserves channel direction.
+        let r_try = check(
+            "fn open_ pair() (<-chan int, chan<- int, error) {\n\
+               return make(<-chan int, 1), make(chan<- int, 1), nil\n\
+             }\n".replace("open_ pair", "open_pair").as_str(),
+        );
+        let _ = r_try;
+        let r_try_use = check(
+            "fn open_pair(rc <-chan int, sc chan<- int) (<-chan int, chan<- int, error) {\n\
+               return rc, sc, nil\n\
+             }\n\
+             fn run(rc0 <-chan int, sc0 chan<- int) error {\n\
+               rc, sc := open_pair(rc0, sc0)?\n\
+               close(rc)\n\
+               for v in sc {\n\
+                 _ = v\n\
+               }\n\
+               return nil\n\
+             }\n",
+        );
+        assert_eq!(
+            r_try_use.verdict,
+            Verdict::Reject,
+            "{:?}",
+            r_try_use.diagnostics
+        );
+        assert_eq!(
+            r_try_use
+                .diagnostics
+                .iter()
+                .filter(|d| d.code == "HYB-E3009")
+                .count(),
+            2,
+            "{:?}",
+            r_try_use.diagnostics
+        );
+
+        // Part 3b: `some(ch).unwrap()` and `opt_ch.or(...)` preserve channel direction.
+        let r_opt = check(
+            "fn bad(rc <-chan int, sc chan<- int) {\n\
+               close(some(rc).unwrap())\n\
+               some(rc).or(rc) <- 1\n\
+               _ = <-some(sc).unwrap()\n\
+             }\n",
+        );
+        assert_eq!(r_opt.verdict, Verdict::Reject, "{:?}", r_opt.diagnostics);
+        assert!(r_opt.diagnostics.iter().any(|d| d.code == "HYB-E3009"));
+        assert!(r_opt.diagnostics.iter().any(|d| d.code == "HYB-E3008"));
+
+        // Part 3c: parallel local define (`rc, alias := make(chan int, 1), rc`)
+        // evaluates RHS against the pre-statement environment.
+        let r_parallel = check(
+            "fn bad(rc <-chan int) {\n\
+               if true {\n\
+                 rc, alias := make(chan int, 1), rc\n\
+                 _ = rc\n\
+                 close(alias)\n\
+                 alias <- 1\n\
+               }\n\
+             }\n",
+        );
+        assert_eq!(
+            r_parallel.verdict,
+            Verdict::Reject,
+            "{:?}",
+            r_parallel.diagnostics
+        );
+        assert!(r_parallel.diagnostics.iter().any(|d| d.code == "HYB-E3009"));
+        assert!(r_parallel.diagnostics.iter().any(|d| d.code == "HYB-E3008"));
+
+        // Part 3d: pointer-to-array (`*[2]<-chan int`) index, slice, and range iteration.
+        let r_ptr_arr = check(
+            "fn bad(pa *[2]<-chan int) {\n\
+               close(pa[0])\n\
+               for ch in pa {\n\
+                 ch <- 1\n\
+               }\n\
+             }\n",
+        );
+        assert_eq!(
+            r_ptr_arr.verdict,
+            Verdict::Reject,
+            "{:?}",
+            r_ptr_arr.diagnostics
+        );
+        assert!(r_ptr_arr.diagnostics.iter().any(|d| d.code == "HYB-E3009"));
+        assert!(r_ptr_arr.diagnostics.iter().any(|d| d.code == "HYB-E3008"));
+    }
+
+    #[test]
+    fn recv_operand_checks_composite_type_headers_and_alias_send_only_channels() {
+        // Part 4a: receive operand embedded inside a composite literal's type header.
+        let r_lit_ty = check(
+            "fn main() {\n\
+               x := 5\n\
+               a := [<-x]int{1}\n\
+               _ = a\n\
+             }\n",
+        );
+        assert_eq!(
+            r_lit_ty.verdict,
+            Verdict::Reject,
+            "{:?}",
+            r_lit_ty.diagnostics
+        );
+        assert!(r_lit_ty.diagnostics.iter().any(|d| d.code == "HYB-E2008"));
+
+        // Part 4b: receive from send-only channel inside closure via `.unwrap()` / alias.
+        let r_closure_send_only = check(
+            "fn bad(sc chan<- int) {\n\
+               f := fn() {\n\
+                 _ = <-some(sc).unwrap()\n\
+               }\n\
+               f()\n\
+             }\n",
+        );
+        assert_eq!(
+            r_closure_send_only.verdict,
+            Verdict::Reject,
+            "{:?}",
+            r_closure_send_only.diagnostics
+        );
+        assert!(r_closure_send_only
+            .diagnostics
+            .iter()
+            .any(|d| d.code == "HYB-E3008" || d.code == "HYB-E2008"));
+    }
+}
